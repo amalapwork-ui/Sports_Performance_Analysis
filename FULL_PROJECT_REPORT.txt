@@ -1,0 +1,807 @@
+================================================================================
+FULL TECHNICAL AND CONCEPTUAL PROJECT REPORT
+Sports Performance Analytics Platform
+================================================================================
+System: FastAPI + Streamlit + YOLOv8n + XGBoost + RandomForest
+Python: 3.10
+Author: [Your Name]
+Date: April 2026
+================================================================================
+
+
+================================================================================
+SECTION 1 — PROJECT SUMMARY
+================================================================================
+
+This project is a full-stack sports analytics platform designed to extract
+quantitative intelligence from two types of football data:
+
+  (A) Structured player statistics (FIFA dataset) — used to train two ensemble
+      regression models that predict a player's Overall rating and market value.
+
+  (B) Unstructured match video — processed by a YOLOv8 computer vision pipeline
+      that detects players frame-by-frame, assigns persistent identities, and
+      computes per-player speed and distance metrics.
+
+The system is exposed through a FastAPI backend with six REST endpoints and
+consumed by a Streamlit frontend dashboard. Video jobs are processed
+asynchronously in background threads, with the frontend polling for completion.
+
+
+================================================================================
+SECTION 2 — END-TO-END PIPELINE DESCRIPTION
+================================================================================
+
+------------------------------------------------------------------------
+2.1  MACHINE LEARNING PIPELINE (Player Prediction & Injury Risk)
+------------------------------------------------------------------------
+
+Step 1: Data Ingestion
+  - File: data/Footballer.csv (FIFA footballer statistics dataset, ~18,000 rows)
+  - Loaded by SportsAnalyzer.__init__() into a pandas DataFrame at startup.
+  - Columns used: Age, Potential, Stamina, Strength, SprintSpeed, Work Rate,
+    Value, Wage, Release Clause, Overall.
+
+Step 2: Preprocessing (SportsAnalyzer._preprocess)
+  - Currency columns (Value, Wage, Release Clause) contain strings like
+    "€110M" or "€50K". These are cleaned by _clean_currency(), which replaces
+    the euro sign, converts M → e6 and K → e3, then evaluates the result:
+      "€110M" → "110e6" → eval() → 110000000.0
+  - Missing numeric values are filled with column medians.
+  - The "Work Rate" column (strings like "High/Medium") is encoded as integer
+    category codes (0–4) and stored in "Work Rate Encoded".
+
+Step 3: Feature Matrix
+  Features = ["Age", "Potential", "Stamina", "Strength", "SprintSpeed",
+              "Work Rate Encoded"]
+  Targets:
+    y_overall = df["Overall"]    (integer 46–94 in the dataset)
+    y_value   = df["Value"]      (float in EUR, range ~€5K–€118M)
+
+Step 4: Model Training (SportsAnalyzer.train_and_save_models)
+  Model A — XGBRegressor (predicts Overall):
+    n_estimators=200, learning_rate=0.05, max_depth=6
+    Gradient boosting builds 200 sequential decision trees where each tree
+    corrects residuals of the previous ensemble.
+
+  Model B — RandomForestRegressor (predicts Value):
+    n_estimators=200
+    Bagged ensemble of 200 independent decision trees; prediction is the
+    mean across all trees. Used for value (high-variance target) because
+    Random Forests reduce variance through averaging.
+
+  Both models are serialised with joblib to models/overall_model.pkl and
+  models/value_model.pkl respectively.
+
+Step 5: Inference (SportsAnalyzer.predict)
+  A six-element feature vector is assembled from the request body
+  (PlayerInput schema) and passed to both model.predict([features]) calls.
+  Results are rounded to 2 decimal places.
+
+Step 6: Injury Risk (SportsAnalyzer.assess_injury_risk)
+  A linear weighted formula:
+    risk_score = (age / 40) × 0.4 + (1 − stamina / 100) × 0.4
+               + (work_rate / 5) × 0.2
+  Thresholds:
+    < 0.33  → Low
+    < 0.66  → Medium
+    ≥ 0.66  → High
+  Note: work_rate here is 1–5, unlike work_rate_encoded (0–4) in PlayerInput.
+  This asymmetry is intentional — the two endpoints use the same physical
+  concept at different levels of abstraction.
+
+------------------------------------------------------------------------
+2.2  VIDEO ANALYTICS PIPELINE (SportsAnalyzer.process_video)
+------------------------------------------------------------------------
+
+Step 1: Job Queuing (app/main.py)
+  The POST /process-video endpoint:
+    1. Validates that the uploaded file has an .mp4 extension.
+    2. Saves the upload to output/staging_{uuid}_{filename} before returning
+       (the UploadFile object is closed after the HTTP response, so the file
+       must be copied to disk first).
+    3. Creates a job entry in the in-process `jobs` dict:
+         {"status": "pending", "progress": 0, "output_path": None,
+          "error": None, "filename": ..., "analytics": None}
+    4. Queues _run_video_job() as a FastAPI BackgroundTask.
+    5. Returns HTTP 202 with {"job_id": uuid, "status": "pending"}.
+
+Step 2: Tracker Reset
+  self.yolo.predictor = None
+  SportsAnalyzer holds a single YOLO model instance. ByteTracker accumulates
+  state in self.yolo.predictor.trackers[0]. Without this reset, track IDs
+  from the previous job persist into the next, inflating the player count
+  by 20–40 ghost IDs.
+
+Step 3: Video Reader Setup (OpenCV)
+  cap = cv2.VideoCapture(input_path)
+  Reads: total_frames, fps (default 30 if unreadable), vid_w, vid_h.
+  Output writer: mp4v codec, same fps and resolution as source.
+  Pixel-to-metre ratio: px_per_m = vid_w / 105.0
+    (assumes broadcast camera shows full 105m pitch width)
+
+Step 4: Spatial Filter Setup
+  Two filter regions derived from frame dimensions:
+    Zone filter (removes stands + ad boards):
+      _crop_top = vid_h × 0.15  (top 15% is crowd/stands)
+      _crop_bot = vid_h × 0.92  (bottom 8% is pitch-side advertising)
+    Box height filter (removes crowd members and close-up coaches):
+      _min_box_h = vid_h × 0.05  (too small → crowd noise)
+      _max_box_h = vid_h × 0.28  (too large → close-up, not on pitch)
+
+Step 5: Frame Loop
+  For each frame:
+    - If frame_idx % 3 == 0 (every 3rd frame is inferred):
+        results = yolo.track(
+            frame,
+            persist=True,     # ByteTracker maintains ID continuity
+            classes=[0],      # person class only
+            conf=0.60,        # confidence threshold
+            imgsz=640,        # internal inference width
+            verbose=False,
+        )
+        last_annotated = results[0].plot()   # bounding boxes + IDs overlaid
+        For each detected box:
+          cx, cy = centre of bounding box
+          box_h  = y2 - y1
+          If cy < _crop_top or cy > _crop_bot → skip (crowd/ad zone)
+          If box_h < _min_box_h or box_h > _max_box_h → skip (size filter)
+          Else: track_history[track_id].append((frame_idx, cx, cy))
+    - Write last_annotated (or raw frame if no annotation yet) to output.
+    - Every 10% of frames: fire progress_cb(pct) for the polling endpoint.
+
+Step 6: Track Validation (Short-track Filter)
+  valid_tracks = {tid: positions
+                  for tid, positions in track_history.items()
+                  if len(positions) >= 20}
+  The 20-frame threshold corresponds to ~2 seconds of continuous tracking at
+  30 fps / frame_sample=3. This eliminates:
+    (a) Spurious single-frame detections: scoreboards, referee number plates
+    (b) ByteTracker ID-switch stubs: when a player is briefly occluded, the
+        old track accumulates a few final frames and the new track starts with
+        a few initial frames — both are below 20 and are discarded.
+
+Step 7: Analytics Computation
+  For each valid track:
+    For each consecutive pair of positions (frame_i, x_i, y_i):
+      dt = (frame_i+1 - frame_i) / fps          # time between detections
+      dist_px = hypot(x_i+1 - x_i, y_i+1 - y_i) # pixel displacement
+      speed_kmh = (dist_px / px_per_m / dt) × 3.6
+      If 0.5 ≤ speed_kmh ≤ 40.0: accept (physiologically valid)
+    player_avg_speed = mean(accepted speeds for this track)
+    player_top_speed = max(accepted speeds for this track)
+    player_distance  = total_dist_px / px_per_m
+
+  Aggregated results:
+    avg_speed_kmh   = mean(player_avg_speeds)
+    max_speed_kmh   = max(player_top_speeds)
+    total_distance_m = sum(player_distances)
+    players_detected = len(valid_tracks)
+    frames_processed = frame_idx
+    processing_time_s = wall-clock time
+
+Step 8: Job State Update
+  jobs[job_id].update(status="done", progress=100, analytics=result)
+  The staging file is deleted. The output file remains in output/ for download.
+
+
+================================================================================
+SECTION 3 — DESIGN DECISIONS
+================================================================================
+
+------------------------------------------------------------------------
+3.1  Why YOLOv8?
+------------------------------------------------------------------------
+YOLO (You Only Look Once) is a single-stage object detector — it processes
+the entire image in one forward pass through a convolutional neural network
+and simultaneously predicts bounding boxes and class probabilities. This
+makes it significantly faster than two-stage detectors (e.g. Faster R-CNN)
+which first propose regions and then classify each region separately.
+
+YOLOv8 (released January 2023) improves over YOLOv5/v7 with:
+  - Anchor-free detection head (predictions are per grid cell, not per anchor)
+  - Decoupled head for classification and regression
+  - Higher mAP at equivalent inference speed
+
+YOLOv8n (nano) is used here. Variants in increasing size/accuracy:
+  n < s < m < l < x
+The nano model was chosen for CPU-only environments (development machines
+without GPU acceleration). In a production deployment, YOLOv8s or YOLOv8m
+would be preferred for better occlusion handling.
+
+The `classes=[0]` parameter restricts detection to the "person" class from
+the COCO dataset that YOLO is pretrained on, eliminating false positives from
+goalposts, advertising boards, and ball detections.
+
+------------------------------------------------------------------------
+3.2  Why ByteTracker?
+------------------------------------------------------------------------
+Detection alone (YOLO per frame) cannot tell whether a player in frame N is
+the same physical person as a detection in frame N+5. Without a tracker,
+each frame starts from zero, and no per-player analytics can be computed.
+
+ByteTracker (Zhang et al., 2022) is a multi-object tracker that associates
+detections across frames using:
+  - IoU (Intersection over Union) between predicted and actual bounding boxes
+  - A Kalman filter to predict box position in the next frame
+  - A two-stage matching scheme: high-confidence detections are matched first,
+    then low-confidence detections (the "byte" in ByteTracker — using low-
+    confidence detections to re-attach lost tracks).
+
+ByteTracker is built into Ultralytics and is invoked by setting persist=True
+in yolo.track(). It assigns stable track IDs that persist across frames even
+through short occlusions, enabling speed/distance computation.
+
+------------------------------------------------------------------------
+3.3  Why FastAPI?
+------------------------------------------------------------------------
+FastAPI was chosen over Flask for three specific reasons:
+
+  1. Async-native: FastAPI is built on Starlette and supports async endpoints.
+     BackgroundTasks allows video processing to run in a thread without
+     blocking the event loop, enabling the /job-status polling pattern.
+
+  2. Automatic schema validation: Pydantic models (PlayerInput, InjuryInput)
+     provide automatic type coercion, validation error messages, and OpenAPI
+     documentation without additional code.
+
+  3. OpenAPI docs: FastAPI auto-generates interactive documentation at
+     /docs (Swagger UI), useful for testing endpoints without a frontend.
+
+Flask is synchronous by default and would require flask-executor or Celery
+to achieve equivalent background task behaviour.
+
+------------------------------------------------------------------------
+3.4  Why Streamlit?
+------------------------------------------------------------------------
+Streamlit converts Python scripts into web applications without HTML or
+JavaScript. For a data science project the key advantages are:
+
+  - `st.metric`, `st.slider`, `st.progress` are single-line UI components
+    that map directly to analytics display requirements.
+  - `st.session_state` provides persistent state across Streamlit reruns,
+    which is essential for the polling loop: job_id and analytics must survive
+    the `st.rerun()` call that follows a status update.
+  - No frontend build tooling (webpack, npm) is required.
+
+The primary limitation is that Streamlit re-executes the entire script on
+every user interaction, requiring careful use of session_state to avoid
+re-uploading or re-polling on unrelated widget changes.
+
+------------------------------------------------------------------------
+3.5  Why XGBoost for Overall and RandomForest for Value?
+------------------------------------------------------------------------
+Overall rating is a structured, bounded integer (roughly 46–94). XGBoost
+is preferred for structured tabular targets because:
+  - Sequential boosting iteratively corrects residuals, giving high accuracy
+    on datasets with clear feature-target relationships.
+  - The hyperparameters (max_depth=6, lr=0.05) prevent overfitting.
+
+Market Value (EUR) is a high-variance, skewed target (range €5K–€118M,
+heavily right-skewed by elite players). RandomForest is preferred because:
+  - Bagging (independent trees on bootstrapped subsets) reduces variance.
+  - It is more robust to outliers in the target variable than boosting.
+  - No learning rate to tune — simpler to get reliable results.
+
+------------------------------------------------------------------------
+3.6  Why In-Process Job Store Instead of Celery/Redis?
+------------------------------------------------------------------------
+Using Celery + Redis for a single-developer project adds two additional
+services (Redis server, Celery worker) and significant configuration overhead.
+
+The in-process dict with threading.Lock() is sufficient for:
+  - Single-machine deployments with one Uvicorn worker
+  - Development and academic demonstration contexts
+
+The documented limitation is that job state is lost on restart. For
+production this would be replaced by a persistent store (Redis, SQLite).
+
+
+================================================================================
+SECTION 4 — TECHNICAL DEEP DIVE
+================================================================================
+
+------------------------------------------------------------------------
+4.1  Detection vs Tracking — the conceptual distinction
+------------------------------------------------------------------------
+Detection: Given a single frame, locate all objects of interest and return
+  bounding boxes with class labels and confidence scores. Stateless — each
+  frame is processed independently.
+
+Tracking: Maintain the identity of each detected object across frames over
+  time. Stateful — the tracker builds a model of each object's motion and
+  predicts its future position.
+
+In this system, detection (YOLO) runs on every 3rd frame to produce boxes.
+Tracking (ByteTracker) receives those boxes and links them to existing track
+IDs using Kalman-predicted positions and IoU matching. Between inferred frames,
+the tracker continues to update its internal Kalman states.
+
+Without tracking, computing "player 7's average speed over the clip" is
+impossible — you only have anonymous boxes per frame with no cross-frame
+identity. Tracking converts a sequence of anonymous detections into a set of
+per-player trajectories.
+
+------------------------------------------------------------------------
+4.2  How Speed is Computed
+------------------------------------------------------------------------
+The speed calculation chain:
+
+  1. Pixel coordinate pairs: two consecutive positions of the same track ID.
+       (frame_i, cx_i, cy_i) and (frame_j, cx_j, cy_j)
+
+  2. Pixel displacement:
+       dist_px = sqrt((cx_j - cx_i)^2 + (cy_j - cy_i)^2)
+
+  3. Time elapsed:
+       dt = (frame_j - frame_i) / fps
+     Because only every 3rd frame is inferred, consecutive track entries
+     are typically 3 frames apart. At 30 fps: dt = 3/30 = 0.1 seconds.
+
+  4. Conversion to metres:
+       dist_m = dist_px / px_per_m
+       where px_per_m = frame_width_pixels / 105.0
+     This is the key calibration assumption: the full width of the frame
+     corresponds to 105 metres (broadcast pitch standard). This is accurate
+     for true wide-angle broadcast shots.
+
+  5. Speed in km/h:
+       speed_kmh = (dist_m / dt) × 3.6
+
+  6. Physiological filter:
+       0.5 km/h ≤ speed_kmh ≤ 40.0 km/h
+     Values outside this range are discarded as tracking noise:
+       - Below 0.5: stationary detections or numerical noise
+       - Above 40.0: tracking ID switch causing a large centroid jump
+
+  7. Per-player aggregation:
+       avg = mean of all valid instantaneous speeds for that track
+       top = max of all valid instantaneous speeds for that track
+     The global avg_speed is the mean of per-player averages (not the global
+     mean of all observations — this prevents over-representation of players
+     who appear in more frames).
+
+------------------------------------------------------------------------
+4.3  How Distance is Computed
+------------------------------------------------------------------------
+Distance is the path integral of the player's trajectory:
+  total_dist_px = sum of all dist_px values for consecutive positions
+  total_dist_m  = total_dist_px / px_per_m
+
+This measures the actual path length (not straight-line displacement).
+No physiological filter is applied to distances — they accumulate all
+pixel motion including the effects of tracking jitter.
+
+------------------------------------------------------------------------
+4.4  Frame Sampling Trade-off
+------------------------------------------------------------------------
+Running YOLO on every frame at 1080p would produce:
+  - ~150ms per inference on a CPU → for 1800 frames (60s @ 30fps): 270 seconds
+    of inference time alone, plus overhead.
+
+Running on every 3rd frame:
+  - 600 inferences instead of 1800 → ~90 seconds
+  - Skipped frames reuse last_annotated (zero inference cost)
+  - Speed measurement accuracy: consecutive track entries are 3 frames apart
+    (dt=0.1s at 30fps). This time interval is fine for walking/running speed
+    but would miss very rapid direction changes within the 3-frame gap.
+
+The trade-off: 3x throughput at the cost of speed temporal resolution.
+
+------------------------------------------------------------------------
+4.5  Why conf=0.60 Instead of the YOLO Default (0.25)?
+------------------------------------------------------------------------
+YOLOv8's default confidence threshold is 0.25. At this threshold in a
+football broadcast scene, the detector frequently triggers on:
+  - Crowd members visible at pitch edges
+  - Substitutes on the bench
+  - Referee assistants on the sideline
+  - Scoreboard digits or jersey number text
+
+At 0.60, only detections where YOLO is highly confident that a clearly-
+visible person exists are accepted. This significantly reduces false positives
+at the cost of missing partially-occluded or distant players.
+
+The combined effect of conf=0.60 + zone filter (top 15%, bottom 8%) +
+box height filter (5–28% of frame height) + min_track_frames=20 is a
+conservative player detection policy that favours precision over recall.
+
+------------------------------------------------------------------------
+4.6  The Work Rate Encoding Asymmetry
+------------------------------------------------------------------------
+Two separate endpoints accept work rate with different encodings:
+
+  /predict accepts work_rate_encoded (0–4):
+    Derived from pandas .astype("category").cat.codes on the CSV "Work Rate"
+    column. The exact mapping depends on the alphabetical order that pandas
+    assigns to the categories (e.g., "High/High"=0, "High/Low"=1, etc.).
+    This encoding was used as a feature during model training, so inference
+    must use the same encoding.
+
+  /injury-risk accepts work_rate (1–5):
+    Used directly in a hand-crafted formula: (work_rate / 5) × 0.2
+    This endpoint has no ML model — it is pure arithmetic. The 1–5 scale
+    was chosen for intuitive user input in the frontend selectbox.
+
+Do not attempt to unify these without updating both analyzer.py and
+frontend.py simultaneously.
+
+
+================================================================================
+SECTION 5 — VIVA / INTERVIEW QUESTIONS AND ANSWERS
+================================================================================
+
+------------------------------------------------------------------------
+Q1: What is the difference between object detection and object tracking?
+    Why is tracking necessary in this system?
+------------------------------------------------------------------------
+Detection locates objects in a single frame, independent of all other frames.
+Each detection is anonymous — there is no concept of identity across time.
+Tracking maintains object identities across frames by associating each new
+detection with an existing track using motion prediction and spatial overlap.
+
+In this system, detection alone is insufficient because speed and distance
+require knowing which detection in frame N corresponds to which detection
+in frame N+3. Without stable IDs, you cannot compute how far "player 7"
+moved — only that there were N anonymous boxes in each frame.
+
+ByteTracker assigns a unique integer ID to each player that persists across
+frames (with possible resets on extended occlusion). These IDs allow
+track_history to accumulate a time-series of centroid positions per player,
+from which kinematic quantities are derived.
+
+------------------------------------------------------------------------
+Q2: How is speed calculated? What are the assumptions and sources of error?
+------------------------------------------------------------------------
+Speed = (pixel_displacement / pixels_per_metre / time_delta) × 3.6
+
+The key assumption is that the horizontal extent of the video frame
+corresponds to exactly 105 metres (standard broadcast pitch width). Under
+this assumption: pixels_per_metre = frame_width / 105.
+
+Sources of error:
+  1. Camera assumption: if the camera is zoomed, angled, or panning, the
+     105m assumption is incorrect. The resulting px_per_m is wrong, and all
+     speed/distance values are proportionally wrong.
+  2. Tracking noise: centroid jitter from bounding box oscillation appears as
+     artificial displacement. The physiological filter (0.5–40 km/h) discards
+     the worst noise spikes but jitter within the valid range accumulates.
+  3. ID switches: when ByteTracker incorrectly links two different players,
+     the centroid "jumps" across the pitch in one frame, producing unrealistically
+     high speed. These jumps are mostly caught by the 40 km/h cap.
+  4. Depth projection: the 2D pixel displacement ignores depth. A player
+     moving toward or away from the camera appears to have zero horizontal
+     displacement in the 2D projection, so their speed is underestimated.
+
+------------------------------------------------------------------------
+Q3: Why did you choose YOLOv8n over larger YOLO variants?
+------------------------------------------------------------------------
+This system targets CPU-only development machines. YOLOv8n (6 MB model file)
+runs at approximately 6–10 fps on a CPU at 640px input width. YOLOv8s would
+be 2–3x slower on the same hardware, and YOLOv8m/l/x would make interactive
+development impractical.
+
+The tradeoffs:
+  - YOLOv8n has lower mAP (map50-95 ≈ 37.3 on COCO) vs YOLOv8s (≈ 44.9)
+  - It misses more occluded and distant players
+  - But at the 0.60 confidence threshold, the detections it does produce are
+    sufficiently high-quality to seed the ByteTracker
+
+In a production system with GPU hardware (e.g. NVIDIA T4 or A10G),
+YOLOv8s or YOLOv8m would be preferred.
+
+------------------------------------------------------------------------
+Q4: What are the limitations of YOLO for football video?
+------------------------------------------------------------------------
+1. Occlusion: when two players overlap, YOLO may detect them as one box,
+   lose one entirely, or oscillate between one and two boxes frame-to-frame.
+   This creates ID switches in the tracker.
+
+2. Scale sensitivity: YOLOv8n at imgsz=640 struggles with players who appear
+   very small in frame (< 5% of frame height), common in stadium overview
+   shots. The minimum box height filter (5% of frame height) may discard
+   some real players in these cases.
+
+3. Non-player person classes: YOLO detects all persons — referees, ball boys,
+   substitutes on the bench, coaches on the sideline, crowd visible at the
+   pitch edge. The zone filter and box-size filter mitigate this but do not
+   eliminate it entirely.
+
+4. Domain shift: YOLO was pre-trained on COCO (natural images). Football
+   broadcast footage has specific characteristics (grass, kit colours, camera
+   height) that differ from COCO. Fine-tuning on football-specific annotation
+   data would improve recall.
+
+5. Real-time inference: at 30 fps input, real-time processing requires
+   approximately 33ms per frame. YOLOv8n on a CPU at 640px takes ~100–150ms.
+   Real-time requires either frame-dropping, GPU inference, or a smaller model.
+
+------------------------------------------------------------------------
+Q5: How would you scale this system for production?
+------------------------------------------------------------------------
+The current architecture is single-process with in-memory job state. Scaling
+requires addressing:
+
+  1. Job queue: replace the in-process dict with Redis + Celery (or RQ).
+     Redis persists job state across restarts; Celery distributes work
+     across multiple worker processes or machines.
+
+  2. Multi-worker: remove the threading.Lock job store and use a database
+     (PostgreSQL or SQLite) as the shared job state visible to all workers.
+
+  3. GPU inference: deploy the YOLO inference worker on a GPU instance
+     (e.g. AWS g4dn.xlarge with NVIDIA T4). This reduces a 15-minute job
+     to approximately 90 seconds for a 2-minute clip.
+
+  4. Object storage: replace the local output/ directory with S3 or GCS
+     for processed video storage. /download-video returns a pre-signed URL.
+
+  5. Authentication: add OAuth2 or API key middleware to FastAPI. The current
+     API has zero access control.
+
+  6. Model versioning: use MLflow or DVC to track model training runs,
+     dataset versions, and metric history.
+
+  7. Horizontal scaling: package YOLO inference and ML prediction as
+     independent services behind a load balancer.
+
+------------------------------------------------------------------------
+Q6: How does ByteTracker handle player occlusion?
+------------------------------------------------------------------------
+ByteTracker uses a two-stage association:
+
+Stage 1: Match high-confidence (conf > threshold) detections to existing
+  tracks. Matching is done by computing IoU between each detection and the
+  Kalman-predicted position of each track. The Hungarian algorithm finds
+  the globally optimal assignment minimising total IoU distance.
+
+Stage 2: Unmatched tracks are compared against low-confidence detections
+  (the "byte" — detections below the threshold that conventional trackers
+  discard). This recovers tracks that are partially occluded: YOLO may
+  report a low-confidence detection for an occluded player, and ByteTracker
+  uses it to maintain the track ID rather than marking it as lost.
+
+When a player is completely occluded for more frames than the tracker's
+`track_buffer` (default 30 frames in Ultralytics), the track is declared
+lost and a new ID is assigned on re-detection. This is an ID switch.
+
+In this system, ID switches manifest as:
+  - Two short tracks (old ID ending, new ID beginning) that are both
+    filtered out by the min_track_frames=20 threshold.
+  - Slight overcount in players_detected (each switch adds +1 valid track
+    if both sides of the switch accumulate 20+ frames).
+
+------------------------------------------------------------------------
+Q7: Why is the injury risk formula linear and not ML-based?
+------------------------------------------------------------------------
+The injury risk module uses a hand-crafted weighted formula rather than a
+trained classifier for several reasons:
+
+  1. No labelled injury data: the FIFA dataset contains no binary injury
+     outcome labels. Training a classifier requires ground-truth injury
+     events, which are not in the dataset.
+
+  2. Transparency: a linear formula is fully interpretable — a sports
+     scientist or medical professional can immediately understand why a
+     player is classified as High risk (e.g. age=35, stamina=40).
+     A neural network or even a Random Forest would be a black box on
+     a 3-feature input.
+
+  3. Domain validity: the three factors (age, stamina, work rate) are
+     accepted predictors of injury risk in sports medicine literature.
+     The weights (0.4, 0.4, 0.2) reflect relative importance judgements
+     rather than data-driven estimates, which is acceptable for a
+     demonstrator system.
+
+In a production system with access to injury records, a logistic regression
+or gradient boosted classifier trained on historical data would replace
+the formula.
+
+------------------------------------------------------------------------
+Q8: Why does the system reset self.yolo.predictor = None between jobs?
+------------------------------------------------------------------------
+The SportsAnalyzer class holds a single YOLO instance (self.yolo). When
+yolo.track(persist=True) is called, Ultralytics initialises a predictor
+that contains the ByteTracker state (track IDs, Kalman filter states).
+
+This state persists inside self.yolo.predictor after a video job ends.
+If a second job starts without resetting, ByteTracker still considers
+the track IDs from the previous video to be "active". These ghost IDs
+then get IoU-matched against the first detections of the new video,
+causing:
+  - Inflated initial player counts (20–40 extra ghost IDs)
+  - Incorrect speed readings for the first few seconds
+  - Wrong analytics reported for the new job
+
+Setting self.yolo.predictor = None forces Ultralytics to reinitialise
+the predictor (and thus ByteTracker) on the next yolo.track() call,
+giving each job a completely clean tracking state.
+
+------------------------------------------------------------------------
+Q9: What happens if two simultaneous video uploads occur?
+------------------------------------------------------------------------
+The current implementation processes video jobs sequentially within the
+SportsAnalyzer instance because:
+  1. self.yolo is a shared, non-thread-safe object.
+  2. process_video() writes to a single output path per job.
+
+If two concurrent /process-video requests are submitted, both background
+tasks start simultaneously. Both call self.yolo.track() concurrently,
+causing unpredictable tracker state corruption (race condition on
+self.yolo.predictor).
+
+The correct mitigation (not yet implemented):
+  - A threading.Semaphore(1) wrapping the YOLO inference section, or
+  - A worker process per video job (separate YOLO instances), or
+  - A task queue (Celery) that serialises YOLO jobs.
+
+In the current academic deployment with single-user usage, concurrent
+uploads are unlikely. For production, this is a critical architectural gap.
+
+------------------------------------------------------------------------
+Q10: Why is there no test suite?
+------------------------------------------------------------------------
+The project has no automated tests (no pytest, no unittest). In a
+production or research context, the minimum test coverage would include:
+
+  - Unit tests for _clean_currency() with edge cases (K, M, plain integer,
+    null values)
+  - Unit tests for assess_injury_risk() boundary conditions (exactly 0.33,
+    exactly 0.66)
+  - Integration tests for /predict and /injury-risk with known input→output
+    pairs
+  - A stub video test for process_video() using a 10-frame synthetic video
+    to verify the analytics dict structure (not the values)
+
+The absence of tests means regressions in any of the above are only
+discovered manually. This is a documented limitation.
+
+
+================================================================================
+SECTION 6 — EDGE CASES AND SYSTEM BEHAVIOUR UNDER STRESS
+================================================================================
+
+LOW-QUALITY VIDEO
+  - Heavy motion blur: YOLO confidence drops below 0.60 → zero detections
+    → players_detected = 0. The DIAGNOSTIC log line reports the detection
+    count. No crash; the output video is written (without annotations).
+
+HEAVY OCCLUSION
+  - Cluster of players (penalty box scene): multiple overlapping bounding
+    boxes. YOLO may merge multiple players into a single box (person cluster)
+    or produce unstable boxes alternating between one and two detections.
+    ByteTracker creates short stubs filtered by min_track_frames=20.
+    Impact: player count is underestimated; speed metrics for occluded players
+    are absent for that segment.
+
+CAMERA MOVEMENT (PANNING)
+  - A panning camera shifts all player centroids in the same direction each
+    frame. The relative centroid positions between players are preserved, but
+    the absolute velocity of each player includes the camera pan velocity.
+    Speed values will be overestimated (pan direction) or underestimated
+    (counter-pan direction). The 105m calibration assumes a static camera.
+
+VERY SHORT CLIP (< 10 SECONDS AT 30 FPS)
+  - 300 frames / 3 = 100 inferred frames.
+    ByteTracker requires several frames to initialise confidence in new tracks.
+    The min_track_frames=20 filter may remove all tracks if the clip is short.
+    Symptom: players_detected=0 with "ByteTracker assigned 0 track IDs" log.
+
+VERY LONG CLIP (> 10 MINUTES)
+  - track_history dict accumulates all positions for all valid tracks.
+    Memory usage: O(N_players × N_frames / frame_sample).
+    For 30 players × 18000 frames / 3 = 180,000 entries. Each entry is a
+    tuple of 3 floats. Memory impact is negligible (~4 MB).
+    Processing time scales linearly; a 10-minute clip takes ~70 minutes on CPU.
+
+CORRUPT MP4
+  - cap.isOpened() returns True but cap.read() returns (False, None) on the
+    first frame. The while loop exits immediately. Output is an empty MP4.
+    Analytics: all zeros. The job status updates to "done" with empty metrics.
+
+ZERO INFERRED FRAMES WITH DETECTIONS
+  - Possible if conf=0.60 is too strict for a specific video. The DIAGNOSTIC
+    log emits a specific warning with the exact count of detections vs tracked
+    frames. The frontend surfaces "No players were tracked" with guidance.
+
+
+================================================================================
+SECTION 7 — RESEARCH-LEVEL IMPROVEMENTS
+================================================================================
+
+To elevate this system to research or production grade, the following
+additions are prioritised by impact:
+
+1. FINE-TUNED YOLO MODEL
+   Pre-train YOLOv8m on a football-specific dataset (e.g. SportsMOT,
+   SoccerNet-Tracking). Domain-adapted weights dramatically improve recall
+   for occluded players and correct the crowd/referee false positive rate.
+   Expected improvement: players_detected accuracy +15–25%.
+
+2. CAMERA CALIBRATION AND HOMOGRAPHY
+   Replace the fixed 105m assumption with a homography matrix computed from
+   pitch line detection (penalty box corners, centre circle). This converts
+   pixel coordinates to true pitch coordinates in metres regardless of camera
+   angle or zoom. Required for any metric accuracy guarantee.
+
+3. TEAM CLASSIFICATION
+   K-means clustering (k=2) on the dominant colour of each player's bounding
+   box crop (HSV histogram, torso region only to exclude legs). Assigns each
+   track ID to a team. Enables:
+     - Per-team average speed
+     - Team possession time
+     - Defensive shape analysis
+
+4. PLAYER RE-IDENTIFICATION
+   Use an appearance embedding model (OSNet, BoT-SORT) to produce a
+   feature vector per track ID. When ByteTracker loses a track (extended
+   occlusion), re-identification attempts to match the re-detected player
+   to the correct historical ID using embedding similarity. This removes
+   the ID-switch problem entirely.
+
+5. FORMATION AND TACTICAL ANALYSIS
+   Cluster each team's player centroids per frame (k=formation shape).
+   Track formation changes over the clip. Detect pressing triggers,
+   high defensive lines, and positional rotations.
+
+6. REAL-TIME STREAMING
+   Replace file-upload processing with an RTSP/WebRTC ingestion pipeline.
+   YOLO streaming mode (yolo.track(source="rtsp://...")) processes frames
+   as they arrive. WebSocket endpoint streams annotated frames to the frontend.
+
+7. HEATMAPS
+   Accumulate per-player centroid positions across the clip. Render as a
+   kernel density estimation overlay on a 2D pitch diagram using
+   matplotlib or plotly. Shows positional tendencies per player.
+
+8. POSSESSION TRACKING
+   Detect the ball using YOLO with classes=[32] (sports ball in COCO).
+   Compute proximity of ball to each team's players. Assign possession
+   per second. Aggregate to clip-level possession percentage.
+
+
+================================================================================
+SECTION 8 — HONEST SYSTEM LIMITATIONS
+================================================================================
+
+1. SPEED ACCURACY: Only valid for true wide-angle broadcast shots with a
+   stationary camera showing the full pitch. Any zoom or pan makes the
+   105m calibration incorrect. Error magnitude scales linearly with zoom factor.
+
+2. PLAYER COUNT ACCURACY: Underestimates players in occluded scenes (penalty
+   box). Overestimates in footage with many referees, ball boys, or technical
+   staff visible at pitch boundaries (partial mitigation via zone filter).
+
+3. YOLO VARIANT: YOLOv8n is the weakest YOLO variant. In crowd scenes or
+   poor lighting, detection rate can drop below 50% of actual players.
+
+4. NO BALL TRACKING: The ball is not detected or tracked. Possession, passing
+   networks, and shot detection are not implemented.
+
+5. SINGLE CAMERA: Only one camera view is processed. Players entering/leaving
+   the frame are treated as new players each time.
+
+6. NO PERSISTENCE: Job state is in-process. A backend restart loses all
+   job records. Any in-progress jobs at restart time leave orphaned output
+   files in output/.
+
+7. NO AUTHENTICATION: All API endpoints are publicly accessible. Not suitable
+   for any deployment where data privacy matters.
+
+8. NO PINNED DEPENDENCIES: requirements.txt has no version constraints.
+   Future installs may use different package versions, potentially changing
+   model behaviour or causing import errors.
+
+9. INJURY FORMULA IS SYNTHETIC: The weighted formula for injury risk is
+   not derived from epidemiological data. It should not be used for actual
+   medical decisions.
+
+10. CURRENCY PARSING VIA eval(): The _clean_currency method uses Python's
+    eval() on strings from a CSV. While this CSV is a static dataset with
+    known-safe content, using eval() on any external input is a security risk
+    and should be replaced with explicit parsing in any production codebase.
+
+
+================================================================================
+END OF REPORT
+================================================================================

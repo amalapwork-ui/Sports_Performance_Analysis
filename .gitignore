@@ -1,15 +1,177 @@
-ppt.html
-Dockerfile
-*.mp4
-*.jpg
-README.md
-32440.jpg
-business-person-futuristic-business-environment.jpg
-futuristic-ai-dashboard-display.jpg
-futuristic-football-soccer-player-with-glowing-lights.jpg
-futuristic-soccer-field-illustration.jpg
-myvenv/
+# =============================================================================
+# SPORTS ANALYTICS — Custom .gitignore
+# Tailored to the actual project structure (FastAPI + Streamlit + YOLOv8 + ML)
+# =============================================================================
+
+
+# =============================================================================
+# PYTHON RUNTIME
+# Bytecode and import caches generated automatically — never commit.
+# =============================================================================
 __pycache__/
-data/Footballer.csv
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+
+# =============================================================================
+# VIRTUAL ENVIRONMENTS
+# Local interpreter installations — recreated via `pip install -r requirements.txt`
+# =============================================================================
+myvenv/
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+
+# =============================================================================
+# ENVIRONMENT & SECRETS
+# API keys, database passwords, .env files — must never be committed.
+# =============================================================================
+.env
+.env.*
+*.env
+secrets.json
+config.local.py
+
+
+# =============================================================================
+# ML MODEL WEIGHTS (LARGE BINARY FILES)
+# Trained model files are 250 MB+ and are regenerated on first run from
+# data/Footballer.csv. YOLO weights are downloaded by ultralytics on demand.
+# =============================================================================
 models/
-yolov8n.pt
+*.pkl
+*.joblib
+*.pt
+*.onnx
+*.pb
+*.h5
+*.weights
+*.bin
+yolov8*.pt
+
+
+# =============================================================================
+# DATASET / TRAINING DATA
+# Footballer.csv (9.1 MB) contains proprietary FIFA footballer statistics.
+# Regenerate models from this file locally — do not expose data in the repo.
+# =============================================================================
+data/Footballer.csv
+data/*.csv
+data/*.xlsx
+data/*.json
+
+
+# =============================================================================
+# VIDEO FILES
+# Raw input videos and processed output videos can be hundreds of MB each.
+# The output/ directory is created at runtime by the FastAPI backend.
+# =============================================================================
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+output/
+runs/
+streamlit/
+
+
+# =============================================================================
+# IMAGE FILES (PROJECT-SPECIFIC PRESENTATION ASSETS)
+# Presentation and UI background images — not part of the codebase.
+# =============================================================================
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+ppt.html
+
+
+# =============================================================================
+# LOGS & TEMPORARY FILES
+# Server logs, debug output, and temp upload staging files.
+# =============================================================================
+*.log
+*.tmp
+*.temp
+staging_*.mp4
+
+
+# =============================================================================
+# TESTING & COVERAGE
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+.tox/
+
+
+# =============================================================================
+# TYPE CHECKING & LINTING CACHES
+# =============================================================================
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+
+# =============================================================================
+# BUILD & DISTRIBUTION ARTIFACTS
+# =============================================================================
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+
+# =============================================================================
+# JUPYTER NOTEBOOKS (if used for exploration)
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb
+
+
+# =============================================================================
+# OS-GENERATED FILES
+# =============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+
+# =============================================================================
+# IDE / EDITOR CONFIGS (OPTIONAL — keep if your team uses the same IDE)
+# =============================================================================
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+*.sln.docinfo
+
+
+# =============================================================================
+# DOCKER RUNTIME (not the Dockerfile itself — Dockerfile IS tracked)
+# =============================================================================
+.dockerignore
+docker-compose.override.yml

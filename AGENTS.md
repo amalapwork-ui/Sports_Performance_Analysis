@@ -53,7 +53,8 @@ docker run -p 8000:8000 sports-analytics
 | POST | `/predict` | Predict Overall rating and market value |
 | POST | `/injury-risk` | Assess injury risk (Low/Medium/High) |
 | POST | `/process-video` | Upload MP4, run YOLOv8 tracking, save output to cwd |
-| GET | `/download-video?path=<path>` | Stream processed video file |
+| GET | `/job-status/{job_id}` | Poll async video processing job status |
+| GET | `/download-video/{job_id}` | Stream processed video file by job ID |
 
 ## Coding Conventions
 
